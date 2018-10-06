@@ -1,265 +1,464 @@
-#include <avr/io.h>
-#include "host.h"
-#include "host_driver.h"
+#include <stdint.h>
+#include <string.h>
+#include <avr/pgmspace.h>
+#include <avr/eeprom.h>
+#include "keycode.h"
 #include "serial.h"
-#include "rn42.h"
+#include "host.h"
+#include "action.h"
+#include "action_util.h"
+#include "lufa.h"
+#include "rn42_task.h"
 #include "print.h"
+#include "debug.h"
 #include "timer.h"
 #include "wait.h"
+#include "command.h"
+#include "battery.h"
 
+static bool config_mode = false;
+static bool force_usb = false;
 
-/* Host driver */
-static uint8_t keyboard_leds(void);
-static void send_keyboard(report_keyboard_t *report);
-static void send_mouse(report_mouse_t *report);
-static void send_system(uint16_t data);
-static void send_consumer(uint16_t data);
-
-host_driver_t rn42_driver = {
-    keyboard_leds,
-    send_keyboard,
-    send_mouse,
-    send_system,
-    send_consumer
-};
-
-
-void rn42_init(void)
+static void status_led(bool on)
 {
-    // JTAG disable for PORT F. write JTD bit twice within four cycles.
-    MCUCR |= (1<<JTD);
-    MCUCR |= (1<<JTD);
-
-    // PF7: BT connection control(high: connect, low: disconnect)
-    rn42_autoconnect();
-
-    // PF6: linked(input without pull-up)
-    DDRF  &= ~(1<<6);
-    PORTF |=  (1<<6);
-
-    // PF1: RTS(low: allowed to send, high: not allowed)
-    DDRF &= ~(1<<1);
-    PORTF &= ~(1<<1);
-
-    // PD5: CTS(low: allow to send, high:not allow)
-    DDRD |= (1<<5);
-    PORTD &= ~(1<<5);
-
-    serial_init();
+    if (on) {
+        DDRE  |=  (1<<6);
+        PORTE &= ~(1<<6);
+    } else {
+        DDRE  |=  (1<<6);
+        PORTE |=  (1<<6);
+    }
 }
 
-int16_t rn42_getc(void)
+void rn42_task_init(void)
 {
-    return serial_recv2();
+    battery_init();
+#ifdef NKRO_ENABLE
+    rn42_nkro_last = keyboard_nkro;
+#endif
 }
 
-const char *rn42_gets(uint16_t timeout)
+void rn42_task(void)
 {
-    static char s[24];
-    uint16_t t = timer_read();
-    uint8_t i = 0;
     int16_t c;
-    while (i < 23 && timer_elapsed(t) < timeout) {
-        if ((c = rn42_getc()) != -1) {
-            if ((char)c == '\r') continue;
-            if ((char)c == '\n') break;
-            s[i++] = c;
+    // Raw mode: interpret output report of LED state
+    while ((c = rn42_getc()) != -1) {
+        // LED Out report: 0xFE, 0x02, 0x01, <leds>
+        // To get the report over UART set bit3 with SH, command.
+        static enum {LED_INIT, LED_FE, LED_02, LED_01} state = LED_INIT;
+        switch (state) {
+            case LED_INIT:
+                if (c == 0xFE) state = LED_FE;
+                else {
+                    if (0x0 <= c && c <= 0x7f) xprintf("%c", c);
+                    else xprintf(" %02X", c);
+                }
+                break;
+            case LED_FE:
+                if (c == 0x02) state = LED_02;
+                else           state = LED_INIT;
+                break;
+            case LED_02:
+                if (c == 0x01) state = LED_01;
+                else           state = LED_INIT;
+                break;
+            case LED_01:
+                dprintf("LED status: %02X\n", c);
+                rn42_set_leds(c);
+                state = LED_INIT;
+                break;
+            default:
+                state = LED_INIT;
         }
     }
-    s[i] = '\0';
-    return s;
-}
 
-void rn42_putc(uint8_t c)
-{
-    serial_send(c);
-}
-
-void rn42_puts(char *s)
-{
-    while (*s)
-	serial_send(*s++);
-}
-
-bool rn42_autoconnecting(void)
-{
-    // GPIO6 for control connection(high: auto connect, low: disconnect)
-    // Note that this needs config: SM,4(Auto-Connect DTR Mode)
-    return (PORTF & (1<<7) ? true : false);
-}
-
-void rn42_autoconnect(void)
-{
-    // hi to auto connect
-    DDRF |= (1<<7);
-    PORTF |= (1<<7);
-}
-
-void rn42_disconnect(void)
-{
-    // low to disconnect
-    DDRF |= (1<<7);
-    PORTF &= ~(1<<7);
-}
-
-bool rn42_rts(void)
-{
-    // low when RN-42 is powered and ready to receive
-    return PINF&(1<<1);
-}
-
-void rn42_cts_hi(void)
-{
-    // not allow to send
-    PORTD |= (1<<5);
-}
-
-void rn42_cts_lo(void)
-{
-    // allow to send
-    PORTD &= ~(1<<5);
-}
-
-bool rn42_linked(void)
-{
-    // RN-42 GPIO2
-    //   Hi-Z:  Not powered
-    //   High:  Linked
-    //   Low:   Connecting
-    return PINF&(1<<6);
-}
+    /* Switch between USB and Bluetooth */
+    if (!config_mode) { // not switch while config mode
+        if (!force_usb && !rn42_rts()) {
+            if (host_get_driver() != &rn42_driver) {
+                clear_keyboard();
+#ifdef NKRO_ENABLE
+                rn42_nkro_last = keyboard_nkro;
+                keyboard_nkro = false;
+#endif
+                host_set_driver(&rn42_driver);
+            }
+        } else {
+            if (host_get_driver() != &lufa_driver) {
+                clear_keyboard();
+#ifdef NKRO_ENABLE
+                keyboard_nkro = rn42_nkro_last;
+#endif
+                host_set_driver(&lufa_driver);
+            }
+        }
+    }
 
 
-static uint8_t leds = 0;
-static uint8_t keyboard_leds(void) { return leds; }
-void rn42_set_leds(uint8_t l) { leds = l; }
+    static uint16_t prev_timer = 0;
+    uint16_t e = timer_elapsed(prev_timer);
+    if (e > 1000) {
+        /* every second */
+        prev_timer += e/1000*1000;
+
+        /* Low voltage alert */
+        uint8_t bs = battery_status();
+        if (bs == LOW_VOLTAGE) {
+            battery_led(LED_ON);
+        } else {
+            battery_led(LED_CHARGER);
+        }
+
+        /* every minute */
+        uint32_t t = timer_read32()/1000;
+        if (t%60 == 0) {
+            uint16_t v = battery_voltage();
+            uint8_t h = t/3600;
+            uint8_t m = t%3600/60;
+            uint8_t s = t%60;
+            dprintf("%02u:%02u:%02u\t%umV\n", h, m, s, v);
+            /* TODO: xprintf doesn't work for this.
+            xprintf("%02u:%02u:%02u\t%umV\n", (t/3600), (t%3600/60), (t%60), v);
+            */
+        }
+    }
 
 
-void rn42_send_str(const char *str)
-{
-    uint8_t c;
-    while ((c = pgm_read_byte(str++)))
-        rn42_putc(c);
-}
-
-const char *rn42_send_command(const char *cmd)
-{
-    static const char *s;
-    rn42_send_str(cmd);
-    wait_ms(500);
-    s = rn42_gets(100);
-    xprintf("%s\r\n", s);
-    rn42_print_response();
-    return s;
-}
-
-void rn42_print_response(void)
-{
-    int16_t c;
-    while ((c = rn42_getc()) != -1) {
-        xprintf("%c", c);
+    /* Connection monitor */
+    if (!rn42_rts() && rn42_linked()) {
+        status_led(true);
+    } else {
+        status_led(false);
     }
 }
 
 
-static void send_keyboard(report_keyboard_t *report)
+
+/******************************************************************************
+ * Command
+ ******************************************************************************/
+static host_driver_t *prev_driver = &rn42_driver;
+
+static void enter_command_mode(void)
 {
-    // wake from deep sleep
+    prev_driver = host_get_driver();
+    clear_keyboard();
+    host_set_driver(&rn42_config_driver);   // null driver; not to send a key to host
+    rn42_disconnect();
+    while (rn42_linked()) ;
+
+    print("Entering config mode ...\n");
+    wait_ms(1100);          // need 1 sec
+    SEND_COMMAND("$$$");
+    wait_ms(600);           // need 1 sec
+    rn42_print_response();
+    const char *s = SEND_COMMAND("v\r\n");
+    if (strncmp("v", s, 1) != 0) SEND_COMMAND("+\r\n"); // local echo on
+}
+
+static void exit_command_mode(void)
+{
+    print("Exiting config mode ...\n");
+    SEND_COMMAND("---\r\n");    // exit
+
+    rn42_autoconnect();
+    clear_keyboard();
+    host_set_driver(prev_driver);
+}
+
+static void init_rn42(void)
+{
+    // RN-42 configure
+    if (!config_mode) enter_command_mode();
+    SEND_COMMAND("SF,1\r\n");  // factory defaults
+    SEND_COMMAND("S-,TmkBT\r\n");
+    SEND_COMMAND("SS,Keyboard/Mouse\r\n");
+    SEND_COMMAND("SM,4\r\n");  // auto connect(DTR)
+    SEND_COMMAND("SW,8000\r\n");   // Sniff disable
+    SEND_COMMAND("S~,6\r\n");   // HID profile
+    SEND_COMMAND("SH,003C\r\n");   // combo device, out-report, 4-reconnect
+    SEND_COMMAND("SY,FFF4\r\n");   // transmit power -12
+    SEND_COMMAND("R,1\r\n");
+    if (!config_mode) exit_command_mode();
+}
+
+#if 0
+// Switching connections
+// NOTE: Remote Address doesn't work in the way manual says.
+// EEPROM address for link store
+#define RN42_LINK0  (uint8_t *)128
+#define RN42_LINK1  (uint8_t *)140
+#define RN42_LINK2  (uint8_t *)152
+#define RN42_LINK3  (uint8_t *)164
+static void store_link(uint8_t *eeaddr)
+{
+    enter_command_mode();
+    SEND_STR("GR\r\n"); // remote address
+    const char *s = rn42_gets(500);
+    if (strcmp("GR", s) == 0) s = rn42_gets(500);   // ignore local echo
+    xprintf("%s(%d)\r\n", s, strlen(s));
+    if (strlen(s) == 12) {
+        for (int i = 0; i < 12; i++) {
+            eeprom_write_byte(eeaddr+i, *(s+i));
+            dprintf("%c ", *(s+i));
+        }
+        dprint("\r\n");
+    }
+    exit_command_mode();
+}
+
+static void restore_link(const uint8_t *eeaddr)
+{
+    enter_command_mode();
+    SEND_COMMAND("SR,Z\r\n");   // remove remote address
+    SEND_STR("SR,");            // set remote address from EEPROM
+    for (int i = 0; i < 12; i++) {
+        uint8_t c = eeprom_read_byte(eeaddr+i);
+        rn42_putc(c);
+        dprintf("%c ", c);
+    }
+    dprintf("\r\n");
+    SEND_COMMAND("\r\n");
+    SEND_COMMAND("R,1\r\n");    // reboot
+    exit_command_mode();
+}
+
+static const char *get_link(uint8_t * eeaddr)
+{
+    static char s[13];
+    for (int i = 0; i < 12; i++) {
+        uint8_t c = eeprom_read_byte(eeaddr+i);
+        s[i] = c;
+    }
+    s[12] = '\0';
+    return s;
+}
+#endif
+
+static void pairing(void)
+{
+    enter_command_mode();
+    SEND_COMMAND("SR,Z\r\n");   // remove remote address
+    SEND_COMMAND("R,1\r\n");    // reboot
+    exit_command_mode();
+}
+
+bool command_extra(uint8_t code)
+{
+    uint32_t t;
+    uint16_t b;
+    switch (code) {
+        case KC_H:
+        case KC_SLASH: /* ? */
+            print("\n\n----- Bluetooth RN-42 Help -----\n");
+            print("i:       RN-42 info\n");
+            print("b:       battery voltage\n");
+            print("Del:     enter/exit RN-42 config mode\n");
+            print("Slck:    RN-42 initialize\n");
+#if 0
+            print("1-4:     restore link\n");
+            print("F1-F4:   store link\n");
+#endif
+            print("p:       pairing\n");
+
+            if (config_mode) {
+                return true;
+            } else {
+                print("u:       toggle Force USB mode\n");
+                return false;   // to display default command help
+            }
+        case KC_P:
+            pairing();
+            return true;
+#if 0
+        /* Store link address to EEPROM */
+        case KC_F1:
+            store_link(RN42_LINK0);
+            return true;
+        case KC_F2:
+            store_link(RN42_LINK1);
+            return true;
+        case KC_F3:
+            store_link(RN42_LINK2);
+            return true;
+        case KC_F4:
+            store_link(RN42_LINK3);
+            return true;
+        /* Restore link address to EEPROM */
+        case KC_1:
+            restore_link(RN42_LINK0);
+            return true;
+        case KC_2:
+            restore_link(RN42_LINK1);
+            return true;
+        case KC_3:
+            restore_link(RN42_LINK2);
+            return true;
+        case KC_4:
+            restore_link(RN42_LINK3);
+            return true;
+#endif
+        case KC_I:
+            print("\n----- RN-42 info -----\n");
+            xprintf("protocol: %s\n", (host_get_driver() == &rn42_driver) ? "RN-42" : "LUFA");
+            xprintf("force_usb: %X\n", force_usb);
+            xprintf("rn42: %s\n", rn42_rts() ? "OFF" : (rn42_linked() ? "CONN" : "ON"));
+            xprintf("rn42_autoconnecting(): %X\n", rn42_autoconnecting());
+            xprintf("config_mode: %X\n", config_mode);
+            xprintf("USB State: %s\n",
+                    (USB_DeviceState == DEVICE_STATE_Unattached) ? "Unattached" :
+                    (USB_DeviceState == DEVICE_STATE_Powered) ? "Powered" :
+                    (USB_DeviceState == DEVICE_STATE_Default) ? "Default" :
+                    (USB_DeviceState == DEVICE_STATE_Addressed) ? "Addressed" :
+                    (USB_DeviceState == DEVICE_STATE_Configured) ? "Configured" :
+                    (USB_DeviceState == DEVICE_STATE_Suspended) ? "Suspended" : "?");
+            xprintf("battery: ");
+            switch (battery_status()) {
+                case FULL_CHARGED:  xprintf("FULL"); break;
+                case CHARGING:      xprintf("CHARG"); break;
+                case DISCHARGING:   xprintf("DISCHG"); break;
+                case LOW_VOLTAGE:   xprintf("LOW"); break;
+                default:            xprintf("?"); break;
+            };
+            xprintf("\n");
+            xprintf("RemoteWakeupEnabled: %X\n", USB_Device_RemoteWakeupEnabled);
+            xprintf("VBUS: %X\n", USBSTA&(1<<VBUS));
+            t = timer_read32()/1000;
+            uint8_t d = t/3600/24;
+            uint8_t h = t/3600;
+            uint8_t m = t%3600/60;
+            uint8_t s = t%60;
+            xprintf("uptime: %02u %02u:%02u:%02u\n", d, h, m, s);
+#if 0
+            xprintf("LINK0: %s\r\n", get_link(RN42_LINK0));
+            xprintf("LINK1: %s\r\n", get_link(RN42_LINK1));
+            xprintf("LINK2: %s\r\n", get_link(RN42_LINK2));
+            xprintf("LINK3: %s\r\n", get_link(RN42_LINK3));
+#endif
+            return true;
+        case KC_B:
+            // battery monitor
+            t = timer_read32()/1000;
+            b = battery_voltage();
+            xprintf("BAT: %umV\t", b);
+            xprintf("%02u:",   t/3600);
+            xprintf("%02u:",   t%3600/60);
+            xprintf("%02u\n",  t%60);
+            return true;
+        case KC_U:
+            if (config_mode) return false;
+            if (force_usb) {
+                print("Auto mode\n");
+                force_usb = false;
+            } else {
+                print("USB mode\n");
+                force_usb = true;
+            }
+            return true;
+        case KC_DELETE:
+            /* RN-42 Command mode */
+            if (rn42_autoconnecting()) {
+                enter_command_mode();
+
+                command_state = CONSOLE;
+                config_mode = true;
+            } else {
+                exit_command_mode();
+
+                command_state = ONESHOT;
+                config_mode = false;
+            }
+            return true;
+        case KC_SCROLLLOCK:
+            init_rn42();
+            return true;
+#ifdef NKRO_ENABLE
+        case KC_N:
+            if (host_get_driver() != &lufa_driver) {
+                // ignored unless USB mode
+                return true;
+            }
+            return false;
+#endif
+        default:
+            if (config_mode)
+                return true;
+            else
+                return false;   // yield to default command
+    }
+    return true;
+}
+
 /*
-    PORTD |= (1<<5);    // high
-    wait_ms(5);
-    PORTD &= ~(1<<5);   // low
-*/
-
-    serial_send(0xFD);  // Raw report mode
-    serial_send(9);     // length
-    serial_send(1);     // descriptor type
-    serial_send(report->mods);
-    serial_send(0x00);
-    serial_send(report->keys[0]);
-    serial_send(report->keys[1]);
-    serial_send(report->keys[2]);
-    serial_send(report->keys[3]);
-    serial_send(report->keys[4]);
-    serial_send(report->keys[5]);
-}
-
-static void send_mouse(report_mouse_t *report)
+ * RN-42 Command mode
+ * sends charactors to the module
+ */
+static uint8_t code2asc(uint8_t code);
+bool command_console_extra(uint8_t code)
 {
-    // wake from deep sleep
-/*
-    PORTD |= (1<<5);    // high
-    wait_ms(5);
-    PORTD &= ~(1<<5);   // low
-*/
-
-    serial_send(0xFD);  // Raw report mode
-    serial_send(5);     // length
-    serial_send(2);     // descriptor type
-    serial_send(report->buttons);
-    serial_send(report->x);
-    serial_send(report->y);
-    serial_send(report->v);
+    rn42_putc(code2asc(code));
+    return true;
 }
 
-static void send_system(uint16_t data)
+// convert keycode into ascii charactor
+static uint8_t code2asc(uint8_t code)
 {
-    // Table 5-6 of RN-BT-DATA-UB
-    // 81,82,83 scan codes can be used?
+    bool shifted = (get_mods() & (MOD_BIT(KC_LSHIFT)|MOD_BIT(KC_RSHIFT))) ? true : false;
+    switch (code) {
+        case KC_A: return (shifted ? 'A' : 'a');
+        case KC_B: return (shifted ? 'B' : 'b');
+        case KC_C: return (shifted ? 'C' : 'c');
+        case KC_D: return (shifted ? 'D' : 'd');
+        case KC_E: return (shifted ? 'E' : 'e');
+        case KC_F: return (shifted ? 'F' : 'f');
+        case KC_G: return (shifted ? 'G' : 'g');
+        case KC_H: return (shifted ? 'H' : 'h');
+        case KC_I: return (shifted ? 'I' : 'i');
+        case KC_J: return (shifted ? 'J' : 'j');
+        case KC_K: return (shifted ? 'K' : 'k');
+        case KC_L: return (shifted ? 'L' : 'l');
+        case KC_M: return (shifted ? 'M' : 'm');
+        case KC_N: return (shifted ? 'N' : 'n');
+        case KC_O: return (shifted ? 'O' : 'o');
+        case KC_P: return (shifted ? 'P' : 'p');
+        case KC_Q: return (shifted ? 'Q' : 'q');
+        case KC_R: return (shifted ? 'R' : 'r');
+        case KC_S: return (shifted ? 'S' : 's');
+        case KC_T: return (shifted ? 'T' : 't');
+        case KC_U: return (shifted ? 'U' : 'u');
+        case KC_V: return (shifted ? 'V' : 'v');
+        case KC_W: return (shifted ? 'W' : 'w');
+        case KC_X: return (shifted ? 'X' : 'x');
+        case KC_Y: return (shifted ? 'Y' : 'y');
+        case KC_Z: return (shifted ? 'Z' : 'z');
+        case KC_1: return (shifted ? '!' : '1');
+        case KC_2: return (shifted ? '@' : '2');
+        case KC_3: return (shifted ? '#' : '3');
+        case KC_4: return (shifted ? '$' : '4');
+        case KC_5: return (shifted ? '%' : '5');
+        case KC_6: return (shifted ? '^' : '6');
+        case KC_7: return (shifted ? '&' : '7');
+        case KC_8: return (shifted ? '*' : '8');
+        case KC_9: return (shifted ? '(' : '9');
+        case KC_0: return (shifted ? ')' : '0');
+        case KC_ENTER: return '\n';
+        case KC_ESCAPE: return 0x1B;
+        case KC_BSPACE: return '\b';
+        case KC_TAB: return '\t';
+        case KC_SPACE: return ' ';
+        case KC_MINUS: return (shifted ? '_' : '-');
+        case KC_EQUAL: return (shifted ? '+' : '=');
+        case KC_LBRACKET: return (shifted ? '{' : '[');
+        case KC_RBRACKET: return (shifted ? '}' : ']');
+        case KC_BSLASH: return (shifted ? '|' : '\\');
+        case KC_NONUS_HASH: return (shifted ? '|' : '\\');
+        case KC_SCOLON: return (shifted ? ':' : ';');
+        case KC_QUOTE: return (shifted ? '"' : '\'');
+        case KC_GRAVE: return (shifted ? '~' : '`');
+        case KC_COMMA: return (shifted ? '<' : ',');
+        case KC_DOT: return (shifted ? '>' : '.');
+        case KC_SLASH: return (shifted ? '?' : '/');
+        case KC_DELETE: return '\0';    // Delete to disconnect
+        default: return ' ';
+    }
 }
-
-
-static uint16_t usage2bits(uint16_t usage)
-{
-    switch (usage) {
-        case APPCONTROL_HOME:         return 0x01;
-        case APPLAUNCH_EMAIL:         return 0x02;
-        case APPCONTROL_SEARCH:       return 0x04;
-        //case AL_KBD_LAYOUT:         return 0x08;  // Apple virtual keybaord toggle
-        case AUDIO_VOL_UP:            return 0x10;
-        case AUDIO_VOL_DOWN:          return 0x20;
-        case AUDIO_MUTE:              return 0x40;
-        case TRANSPORT_PLAY_PAUSE:    return 0x80;
-        case TRANSPORT_NEXT_TRACK:    return 0x100;
-        case TRANSPORT_PREV_TRACK:    return 0x200;
-        case TRANSPORT_STOP:          return 0x400;
-        case TRANSPORT_STOP_EJECT:    return 0x800;
-        case TRANSPORT_FAST_FORWARD:  return 0x1000;
-        case TRANSPORT_REWIND:        return 0x2000;
-        //case return 0x4000;   // Stop/eject
-        //case return 0x8000;   // Internet browser
-    };
-    return 0;
-}
-
-static void send_consumer(uint16_t data)
-{
-    uint16_t bits = usage2bits(data);
-    serial_send(0xFD);  // Raw report mode
-    serial_send(3);     // length
-    serial_send(3);     // descriptor type
-    serial_send(bits&0xFF);
-    serial_send((bits>>8)&0xFF);
-}
-
-
-/* Null driver for config_mode */
-static uint8_t config_keyboard_leds(void);
-static void config_send_keyboard(report_keyboard_t *report);
-static void config_send_mouse(report_mouse_t *report);
-static void config_send_system(uint16_t data);
-static void config_send_consumer(uint16_t data);
-
-host_driver_t rn42_config_driver = {
-    config_keyboard_leds,
-    config_send_keyboard,
-    config_send_mouse,
-    config_send_system,
-    config_send_consumer
-};
-
-static uint8_t config_keyboard_leds(void) { return leds; }
-static void config_send_keyboard(report_keyboard_t *report) {}
-static void config_send_mouse(report_mouse_t *report) {}
-static void config_send_system(uint16_t data) {}
-static void config_send_consumer(uint16_t data) {}
