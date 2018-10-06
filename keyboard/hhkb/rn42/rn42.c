@@ -157,7 +157,7 @@ static void enter_command_mode(void)
 }
 
 static void exit_command_mode(void)
-{
+{Ollie-BT-HHKB
     print("Exiting config mode ...\n");
     SEND_COMMAND("---\r\n");    // exit
 
